@@ -1,0 +1,161 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:8.1.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_KRAFT_MODE: 'true'
+      CLUSTER_ID: 'q1ShLeu3T7G2zjUKw9p6vQ'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+    volumes:
+      - kafka_kraft:/var/lib/kafka/data
+    healthcheck:
+      # test: [ "CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list" ]
+      # interval: 10s
+      # timeout: 5s
+      # retries: 10
+      test: [ "CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    environment:
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-password}
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./interiittechmeetteam11/code/infra/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      # test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      # interval: 5s
+      # timeout: 5s
+      # retries: 10
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  stock_service:
+    build:
+      context: ./interiittechmeetteam11/code/stock_service
+    container_name: stock_service
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      - KAFKA_BROKER=kafka:9092
+    restart: on-failure
+
+  news_service:
+    build:
+      context: ./interiittechmeetteam11/code/news_service
+    container_name: news_service
+    depends_on:
+      kafka:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - USE_DUMMY_API=true
+      - API_KEY=${API_KEY:-dummy_key}
+      - API_URL=${API_URL:-dummy_url}
+    restart: on-failure
+
+  backend:
+    build:
+      context: ./interiittechmeetteam11/code/backend
+    container_name: backend
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - USE_DUMMY_FIREBASE=true
+    restart: on-failure
+
+  decision_service:
+    build:
+      context: ./interiittechmeetteam11/code/decision_service
+    container_name: decision_service
+    depends_on:
+      kafka:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-password}
+    restart: on-failure
+
+  calc_service:
+    build:
+      context: ./interiittechmeetteam11/code/calc_service
+    container_name: calc_service
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      - KAFKA_BROKER=kafka:9092
+    volumes:
+      - calc_data:/app/data
+    restart: on-failure
+  # ========== Legacy/Commented Services ==========
+  # (Kept for reference - not used in current setup)
+  # news_service:
+  #   build:
+  #     context: ./interiittechmeetteam11/code/news_service
+  #   container_name: news_service
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     clickhouse:
+  #       condition: service_healthy
+  #     infra_init:
+  #       condition: service_completed_successfully
+  #     calc_service:
+  #       condition: service_started
+  #   environment:
+  #     - KAFKA_BROKER=kafka:9092
+  #     - CLICKHOUSE_URL=http://clickhouse:8123
+  #     - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-password}
+  #   env_file:
+  #     - ./interiittechmeetteam11/code/news_service/.env
+  #   restart: on-failure
+
+  # stock_service:
+  #   build:
+  #     context: ./interiittechmeetteam11/code/stock_service
+  #   container_name: stock_service
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     news_service:
+  #       condition: service_started
+  #   environment:
+  #     - KAFKA_BROKER=kafka:9092
+  #   restart: on-failure
+
+volumes:
+  kafka_kraft:
+  clickhouse_data:
+  calc_data:

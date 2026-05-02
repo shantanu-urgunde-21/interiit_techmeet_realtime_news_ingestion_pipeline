@@ -47,11 +47,13 @@ $ USE market_data;
 $ SHOW tables;
 ```
 
-The output should be names of 4 tables:
-1. final_table
-2. kafka_input
-3. mv_kafka_to_final
-4. sentiment_stream
+The output should be names of the tables and materialized views:
+1. final_table (Historical analytics table)
+2. kafka_input (Kafka engine table)
+3. mv_kafka_to_final (Materialized view)
+4. sentiment_stream (News sentiment table)
+
+*Note: ClickHouse uses two different paradigms here. It consumes stock calculations passively from Kafka using `kafka_input`, and it receives news sentiment actively via HTTP API calls from the news service into `sentiment_stream`.*
 
 **4. Run the kafka server**
 Go back to `infra` service and then run:
@@ -61,8 +63,10 @@ $ docker compose up # or sudo docker compose up if permission is denied
 This will start the kafka server
 
 **5. Running the microservices**
-The microservices can be run in any order, except the fact that stock service must be run in the end.
-We recommend to run the services in the alphabetical order itself.
+The microservices have specific startup dependencies:
+- `news_service` strictly requires timestamps from `calc_service` to run.
+- `calc_service` and `decision_service` require data from `stock_service`.
+We recommend running the services in this logical order: backend -> decision_service -> calc_service -> news_service -> stock_service.
 
 So go to backend directory, make sure virtual env is activated and run
 ```bash
@@ -89,7 +93,7 @@ Next go to news service, and do the same drill. Activate environment, and run:
 ```bash
 $ python3 main.py
 ```
-This will wait for timestamps, which are required from calculation service which in turn depends on stock service.
+This will enter a loop waiting for timestamps from the `stock_timestamp` Kafka topic (produced by `calc_service`). It will not fetch news until `calc_service` is streaming.
 
 So finally, we go to the stock service, activate the environment and run
 ```bash

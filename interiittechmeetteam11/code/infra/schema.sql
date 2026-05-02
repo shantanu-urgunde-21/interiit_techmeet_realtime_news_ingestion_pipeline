@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS kafka_input (
     pct_change Float32
 )
 ENGINE = Kafka
-SETTINGS kafka_broker_list = 'localhost:9092',        -- Use docker service name in production
-         kafka_topic_list = 'stock_table_trial',
+SETTINGS kafka_broker_list = 'kafka:9092',        -- Use docker service name in production
+         kafka_topic_list = 'stock_calculation_table',
          kafka_group_name = 'clickhouse_group',
          kafka_format = 'JSONEachRow',
          kafka_num_consumers = 1,                
@@ -70,10 +70,7 @@ SETTINGS index_granularity = 8192;        -- Good balance for analytics workload
    (Pipes Kafka → final_table)
    ============================================================ */
 
--- Drop & recreate to avoid “already exists” errors
-DROP VIEW IF EXISTS mv_kafka_to_final;
-
-CREATE MATERIALIZED VIEW mv_kafka_to_final
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_kafka_to_final
 TO final_table
 AS
 SELECT
@@ -100,4 +97,15 @@ FROM kafka_input;
    4. SENTIMENT STREAM TABLE  
    (Also optimized for time-series analytics)
    ============================================================ */
-CREATE TABLE IF NOT EXISTS sentiment_stream (     symbol String,     news_titles Array(String),     news_timestamps Array(String),     sentiment_scores Array(Float64),     relevance_scores Array(Float64),     weighted_avg_sentiment Float64,     news_url String, cycle Float64 ) ENGINE = MergeTree() ORDER BY cycle;
+CREATE TABLE IF NOT EXISTS sentiment_stream (     
+   symbol String,     
+   news_titles Array(String),     
+   news_timestamps Array(String),     
+   sentiment_scores Array(Float64),     
+   relevance_scores Array(Float64),     
+   weighted_avg_sentiment Float64,     
+   news_url String, 
+   cycle Float64 
+) 
+ENGINE = MergeTree() 
+ORDER BY (cycle, symbol);

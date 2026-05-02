@@ -4,9 +4,19 @@ Firebase Cloud Messaging (FCM) Message Sender
 This module handles sending push notifications to mobile devices via Firebase.
 All message data values must be strings as per FCM requirements.
 """
-from firebase_admin import messaging
-import logging
+import os
 
+# Check if we should use dummy firebase for testing
+USE_DUMMY_FIREBASE = os.getenv("USE_DUMMY_FIREBASE", "false").lower() == "true"
+
+if USE_DUMMY_FIREBASE:
+    import dummy_firebase as firebase_admin
+    from dummy_firebase import messaging
+else:
+    import firebase_admin
+    from firebase_admin import messaging
+
+import logging
 logger = logging.getLogger(__name__)
 
 def send_data_message(data: dict):

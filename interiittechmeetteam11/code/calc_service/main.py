@@ -83,7 +83,7 @@ try:
         rdkafka_settings={
             "bootstrap.servers": kafka_broker,
             "group.id": "pathway-group",
-            "auto.offset.reset": "earliest",  # Start from beginning if no offset exists
+            "auto.offset.reset": "latest",  # Start from latest if no offset exists
         },
         topic="stock_table",
         format="json",
@@ -884,31 +884,6 @@ final_table = enriched_final.select(
 # ============================================================================
 # Write enriched technical analysis data to Kafka topics for downstream consumers
 
-# Prepare timestamp output for synchronization/coordination purposes
-# This is a separate topic that may be used by other services for timing
-logger.info("Preparing timestamp output for Kafka topic 'stock_timestamp'")
-timestamp_output = quotes.select(
-    quotes.timestamp  # Just the timestamp string, no key
-)
-
-# Write timestamp to separate Kafka topic
-# Format: raw (plain string) for simple timestamp forwarding
-try:
-    logger.info(f"Configuring Kafka writer for topic 'stock_timestamp' (broker: {kafka_broker})")
-    pw.io.kafka.write(
-        timestamp_output,
-        {
-            "bootstrap.servers": kafka_broker,
-            "group.id": "pathway-group-timestamp",
-        },
-        topic_name="stock_timestamp",
-        format="raw",  # Use "raw" format to send plain strings
-    )
-    logger.info("Kafka writer configured for 'stock_timestamp' topic")
-except Exception as e:
-    logger.error(f"Failed to configure Kafka writer for 'stock_timestamp': {str(e)}", exc_info=True)
-    raise
-
 # Write final enriched table with all technical indicators to Kafka
 # This is the main output topic containing all calculated metrics
 try:
@@ -934,7 +909,17 @@ except Exception as e:
 logger.info("Starting Pathway computation pipeline...")
 logger.info("Service is now processing stock data and generating technical indicators")
 try:
-    pw.run()
+    # Use persistence to prevent amnesia (losing 150-min window on restart)
+    try:
+        backend = pw.persistence.Backend.filesystem("./data")
+        try:
+            pw.run(persistence_backend=backend)
+        except TypeError:
+            # Fallback for different Pathway versions
+            pw.run(persistence_config=backend)
+    except Exception as e:
+        logger.warning(f"Persistence not supported or failed: {e}. Running without persistence.")
+        pw.run()
 except KeyboardInterrupt:
     logger.info("Pipeline interrupted by user")
     raise

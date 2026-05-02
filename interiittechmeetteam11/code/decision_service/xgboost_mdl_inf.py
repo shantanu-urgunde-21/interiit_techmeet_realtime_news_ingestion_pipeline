@@ -9,6 +9,7 @@ Input: Kafka topic 'stock_calculation_table' with technical indicators
 Output: Kafka topic 'alert' with trading alerts (when conditions are met)
 """
 import json
+import time
 from kafka import KafkaConsumer, KafkaProducer
 from clickhouse_driver import Client
 import xgboost as xgb
@@ -18,6 +19,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
 import logging
+import os
 
 # Service configuration
 MICROSERVICE_NAME = "decision_service"
@@ -77,10 +79,31 @@ except Exception as e:
 # ============================================================================
 logger.info("Connecting to ClickHouse database")
 try:
-    client = Client(host='localhost')
-    logger.info("Connected to ClickHouse successfully")
+    ch_host = os.getenv("CLICKHOUSE_HOST", "localhost")
+    ch_port = int(os.getenv("CLICKHOUSE_PORT", 9000))
+    ch_password = os.getenv("CLICKHOUSE_PASSWORD", "")
+    
+    # Retry logic for ClickHouse connection
+    max_retries = 30
+    retry_delay = 2
+    client = None
+    
+    for attempt in range(max_retries):
+        try:
+            client = Client(host=ch_host, port=ch_port, password=ch_password)
+            # Test connection
+            client.execute("SELECT 1")
+            logger.info("Connected to ClickHouse successfully")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Failed to connect to ClickHouse (attempt {attempt+1}/{max_retries}): {str(e)}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Failed to connect to ClickHouse after {max_retries} attempts: {str(e)}", exc_info=True)
+                raise
 except Exception as e:
-    logger.error(f"Failed to connect to ClickHouse: {str(e)}", exc_info=True)
+    logger.error(f"Configuration error or persistent connection failure: {str(e)}", exc_info=True)
     raise
 
 # ============================================================================
@@ -104,31 +127,49 @@ symbol_to_code = {v: k for k, v in symbol_mapping.items()}
 # ============================================================================
 # Consumer: Read stock calculation data from Kafka
 logger.info("Configuring Kafka consumer for topic 'stock_calculation_table'")
-try:
-    consumer = KafkaConsumer(
-        "stock_calculation_table",
-        bootstrap_servers="localhost:9092",
-        group_id="math-group",
-        auto_offset_reset="latest",  # Start from latest messages
-        enable_auto_commit=True,
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    )
-    logger.info("Kafka consumer configured successfully")
-except Exception as e:
-    logger.error(f"Failed to configure Kafka consumer: {str(e)}", exc_info=True)
-    raise
+kafka_broker = os.getenv("KAFKA_BROKER", "localhost:9092")
+max_retries = 30
+retry_delay = 2
+consumer = None
+
+for attempt in range(max_retries):
+    try:
+        consumer = KafkaConsumer(
+            "stock_calculation_table",
+            bootstrap_servers=kafka_broker,
+            group_id="math-group",
+            auto_offset_reset="latest",
+            enable_auto_commit=True,
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        )
+        logger.info("Kafka consumer configured successfully")
+        break
+    except Exception as e:
+        if attempt < max_retries - 1:
+            logger.warning(f"Kafka not available (attempt {attempt+1}/{max_retries}): {str(e)}. Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+        else:
+            logger.error(f"Failed to connect to Kafka after {max_retries} attempts: {str(e)}", exc_info=True)
+            raise
 
 # Producer: Send alerts to Kafka
 logger.info("Configuring Kafka producer for topic 'alert'")
-try:
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
-    )
-    logger.info("Kafka producer configured successfully")
-except Exception as e:
-    logger.error(f"Failed to configure Kafka producer: {str(e)}", exc_info=True)
-    raise
+producer = None
+for attempt in range(max_retries):
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=[kafka_broker],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        logger.info("Kafka producer configured successfully")
+        break
+    except Exception as e:
+        if attempt < max_retries - 1:
+            logger.warning(f"Kafka not available for producer (attempt {attempt+1}/{max_retries}): {str(e)}. Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+        else:
+            logger.error(f"Failed to connect Kafka producer after {max_retries} attempts: {str(e)}", exc_info=True)
+            raise
 
 logger.info("Waiting for messages from Kafka...")
 print("Waiting for messages...")
@@ -138,6 +179,33 @@ print("Waiting for messages...")
 # ============================================================================
 # Continuously consume stock calculation data, make predictions, and send alerts
 logger.info("Starting main processing loop")
+
+# Initialize in-memory cache for news sentiment
+sentiment_cache = {}
+last_cache_update = 0
+CACHE_TTL = 300  # 5 minutes
+
+def update_sentiment_cache():
+    global sentiment_cache, last_cache_update
+    try:
+        query_all_news = """
+            SELECT symbol, news_titles, weighted_avg_sentiment 
+            FROM market_data.sentiment_stream 
+            WHERE cycle = (SELECT MAX(cycle) FROM market_data.sentiment_stream)
+        """
+        data_news = client.execute(query_all_news)
+        
+        new_cache = {}
+        for row in data_news:
+            symbol, titles, sentiment = row[0], row[1], float(row[2])
+            new_cache[symbol] = (sentiment, str(titles))
+        
+        sentiment_cache = new_cache
+        last_cache_update = time.time()
+        logger.info(f"Updated sentiment cache with {len(sentiment_cache)} symbols")
+    except Exception as e:
+        logger.error(f"Failed to update sentiment cache: {str(e)}", exc_info=True)
+
 
 try:
     for msg in consumer:
@@ -162,34 +230,21 @@ try:
             continue
 
         # ====================================================================
-        # Fetch News Sentiment Data
+        # Fetch News Sentiment Data from Cache
         # ====================================================================
-        # Query latest news sentiment for this symbol from ClickHouse
-        query_news = (
-            f"SELECT symbol, news_titles, weighted_avg_sentiment "
-            f"FROM market_data.sentiment_stream "
-            f"WHERE cycle = (SELECT MAX(cycle) FROM market_data.sentiment_stream) "
-            f"AND symbol='{current_symbol}'"
-        )
+        # Periodically update the cache
+        if time.time() - last_cache_update > CACHE_TTL:
+            update_sentiment_cache()
 
-        try:
-            data_news = client.execute(query_news)
-        except Exception as e:
-            logger.error(f"ClickHouse query error for {current_symbol}: {str(e)}", exc_info=True)
-            print(f"ClickHouse query error for {current_symbol}: {e}")
-            continue
-
-        # Handle missing news data (use neutral sentiment)
-        if not data_news or len(data_news) == 0:
+        # Get sentiment from cache (or use neutral if not found)
+        cache_entry = sentiment_cache.get(current_symbol)
+        
+        if cache_entry is None:
             logger.debug(f"No news data found for {current_symbol}, using sentiment=0")
-            print(f"No news data found for {current_symbol}, using sentiment=0")
             weighted_sentiment = 0.0
             news_titles = "No news available"
         else:
-            columns_news = ['symbol', 'news_titles', 'weighted_avg_sentiment']
-            df_news = pd.DataFrame(data_news, columns=columns_news)
-            weighted_sentiment = float(df_news["weighted_avg_sentiment"].iloc[0])
-            news_titles = str(df_news["news_titles"].iloc[0])
+            weighted_sentiment, news_titles = cache_entry
             logger.debug(f"Retrieved sentiment {weighted_sentiment:.4f} for {current_symbol}")
 
         # ====================================================================

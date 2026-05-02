@@ -1,101 +1,79 @@
-# Real Time AI Investment Decision System
+# Real-Time AI Investment Decision System
 
-## User Guide
+An end-to-end, high-performance microservice pipeline for real-time stock analytics, sentiment analysis, and AI-driven trading alerts.
 
-### Requirements:
-1. Clickhouse Database: [https://clickhouse.com/docs/getting-started/quick-start/oss](https://clickhouse.com/docs/getting-started/quick-start/oss)
-2. Docker: [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
-3. Python (3.12 or 3.13 preferred): [https://www.python.org](https://www.python.org)
+## 🚀 Quick Start
 
-### Steps to run the project
+The entire pipeline is containerized and orchestrated via Docker Compose.
 
-**1. Run the Clichouse Server:**  
-Wherever the clickhouse database file installed, in a terminal `cd` into that folder. And run:
+### Requirements
+- **Docker** and **Docker Compose**
+- (Optional) **Python 3.11+** (only if running training scripts locally)
+
+### Steps to Run
+1. **Clone the repository**
+2. **Start the pipeline**:
+   ```bash
+   docker-compose up -d --build
+   ```
+   *This command will pull the necessary images, build the microservices, and initialize the ClickHouse schema automatically.*
+
+3. **Verify the services**:
+   ```bash
+   docker-compose ps
+   ```
+
+---
+
+## 🏗️ Architecture & Data Flow
+
+The system consists of 6 core services working in a reactive stream:
+
+1.  **Stock Service**: Fetches real-time market data and publishes to Kafka.
+2.  **Calc Service (Pathway)**: Performs windowed GARCH/ARMA calculations and technical indicator generation (EMA, RSI, MACD). Uses **Pathway Persistence** to survive restarts.
+3.  **News Service**: Ingests global news sentiment for all active tickers. Optimized with **Bulk Inserts** to ClickHouse.
+4.  **ClickHouse**: Our primary OLAP database. Schema is initialized natively on boot.
+5.  **Decision Service (XGBoost)**: Consumes technical indicators and sentiment data to predict price moves. Features a **5-minute in-memory sentiment cache** to prevent database bottlenecks.
+6.  **Backend (Alerts)**: Listens for high-confidence predictions and sends alerts via Firebase Cloud Messaging (FCM).
+
+---
+
+## 🛠️ Configuration & Development
+
+### Local Testing (Dummy Mode)
+By default, the pipeline is configured for easy local testing without external dependencies:
+- **Firebase**: `USE_DUMMY_FIREBASE=true` in `docker-compose.yml` enables a mock alert system.
+- **Stock API**: `USE_DUMMY_API=true` in `stock_service` environments uses simulated market data.
+
+### Retraining the AI Models
+If you have new data in ClickHouse and want to update the XGBoost models:
+1. Enter the decision service container:
+   ```bash
+   docker-compose exec decision_service bash
+   ```
+2. Run the consolidated training script:
+   ```bash
+   python train_models.py
+   ```
+3. Restart the service to load new models:
+   ```bash
+   docker-compose restart decision_service
+   ```
+
+---
+
+## ⚡ Performance Optimizations
+
+This pipeline has been hardened for production-level throughput:
+- **Bulk Ingestion**: `news_service` batches hundreds of ticker updates into single ClickHouse transactions.
+- **In-Memory Caching**: `decision_service` avoids hammering the database by caching sentiment scores in RAM, updating every 5 minutes.
+- **State Persistence**: `calc_service` uses a persistent Docker volume (`calc_data`) to retain its 150-minute sliding window memory across restarts.
+- **Native Initialization**: Replaced legacy Python infra-init scripts with native ClickHouse entrypoint SQL initialization for 100% reliability.
+
+---
+
+## 📜 Logs & Monitoring
+Each service logs its activity to the shared `logs` directory or can be viewed via Docker:
 ```bash
-$ ./clickhouse server
+docker-compose logs -f [service_name]
 ```
-
-In a new terminal window, go to the clickhouse directory and run the clickhouse client
-```bash
-$ ./clickhouse client
-```
-
-**2. Creating virtual envenvironments**  
-In  all the directories present with this README file, there are requirements files and some python files, and also the files for environment variables. Open CLI in each folder and run the following commands to create virtual environments, and install the requirments.
-
-```bash
-$ python3 -m venv env
-$ source env/bin/activate # for windows, env\Scripts\activate.ps1 (for powershell) or activate.bat (for command prompt)
-$ pip3 install -r requirements.txt
-```
-
-**3. Creating the database and schema**  
-Go to the `infra` directory, make sure that the virtual environment is activated and then run the following command:
-```bash
-$ python3 main.py
-```
-This will create the `market_data` clickhouse database and its required tables. You can verify this by going to the terminal window where clickhouse client is running and then run,
-```bash
-$ SHOW databases;
-```
-
-The output should include `market_data` database
-
-and then run
-```bash
-$ USE market_data;
-$ SHOW tables;
-```
-
-The output should be names of 4 tables:
-1. final_table
-2. kafka_input
-3. mv_kafka_to_final
-4. sentiment_stream
-
-**4. Run the kafka server**
-Go back to `infra` service and then run:
-```bash
-$ docker compose up # or sudo docker compose up if permission is denied
-```
-This will start the kafka server
-
-**5. Running the microservices**
-The microservices can be run in any order, except the fact that stock service must be run in the end.
-We recommend to run the services in the alphabetical order itself.
-
-So go to backend directory, make sure virtual env is activated and run
-```bash
-$ python3 main.py
-```
-
-This won't output anything yet, but you can see a logs folder where we will store all the logs
-
-Then go to calc_service, with respective env activated and run
-```bash
-$ python3 main.py
-```
-
-This will take some time to run, and it will start the pathway computational stream but might show errors as we are not pushing anything to the required kafka topic yet. That will be done in the end in the stock service
-
-Then go to decision service, with respective env activated and run
-```bash
-$ python3 xgboost_mdl_inf.py
-```
-
-This will output `Waiting for messages...`
-
-Next go to news service, and do the same drill. Activate environment, and run:
-```bash
-$ python3 main.py
-```
-This will wait for timestamps, which are required from calculation service which in turn depends on stock service.
-
-So finally, we go to the stock service, activate the environment and run
-```bash
-$ python3 main.py
-```
-
-This will take few seconds to run, but as soon as it starts pushing to kafka topic, outputs should start becoming visible in all the other microservices as well.
-
-The main output that we won't to see is the alert messages being sent through Firebase Cloud Messagin service. This output might not be as frequent as outputs of other services, but it should send whenever the decision service finds a change of more than 2%, and pushes to the alert topic. The output of backend service would start with *'Alert sent'*.

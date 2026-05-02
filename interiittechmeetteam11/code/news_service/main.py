@@ -14,7 +14,6 @@ import time
 import hashlib
 import requests
 from dotenv import load_dotenv
-from kafka import KafkaProducer, KafkaConsumer
 from datetime import datetime, timedelta
 from threading import Thread, Lock
 import os
@@ -26,6 +25,7 @@ load_dotenv()
 
 # Service configuration
 MICROSERVICE_NAME = "news_service"
+USE_DUMMY_API = os.getenv("USE_DUMMY_API", "false").lower() == "true"
 
 # Ensure logs directory exists
 log_dir = Path("../logs")
@@ -43,10 +43,10 @@ logging.basicConfig(
 
 logger = logging.getLogger(MICROSERVICE_NAME)
 logger.info(f"Starting {MICROSERVICE_NAME} - Initializing news ingestion pipeline")
+logger.info(f"Using dummy API: {USE_DUMMY_API}")
 
 ALPHA_API_KEY = os.getenv("API_KEY")
 BASE_URL = os.getenv("API_URL")
-KAFKA_TOPIC = "News"
 TIMESTAMP_TOPIC = "stock_timestamp"
 
 top_240_popular_tickers = [
@@ -85,162 +85,7 @@ TOPICS = [
 ]
 
 
-class TimestampManager:
-    """
-    Manages date range for news API queries by consuming timestamps from Kafka.
-    
-    This class maintains a sliding 10-day window based on the latest timestamp
-    received from the stock service. It runs in a background thread to continuously
-    update the date range as new timestamps arrive.
-    """
-
-    def __init__(self):
-        """Initialize timestamp manager with default state."""
-        self.current_end_date = None
-        self.current_start_date = None
-        self.lock = Lock()  # Thread-safe access to date range
-        self.consumer = None
-        self.running = False
-        logger.debug("TimestampManager initialized")
-
-    def _parse_timestamp(self, timestamp_str: str) -> datetime:
-        """
-        Parse timestamp string to datetime object.
-        
-        Tries multiple common timestamp formats to handle various input formats.
-        
-        Args:
-            timestamp_str: Timestamp string in various formats
-        
-        Returns:
-            datetime object if parsing succeeds, None otherwise
-        """
-        try:
-            # Try common timestamp formats in order of likelihood
-            formats = [
-                "%Y-%m-%d %H:%M:%S",  # Standard format: 2024-01-15 14:30:00
-                "%Y-%m-%d",  # Date only: 2024-01-15
-                "%Y%m%d",  # Compact format: 20240115
-                "%Y-%m-%dT%H:%M:%S"  # ISO-like format: 2024-01-15T14:30:00
-            ]
-            
-            for fmt in formats:
-                try:
-                    parsed = datetime.strptime(timestamp_str, fmt)
-                    logger.debug(f"Parsed timestamp '{timestamp_str}' using format '{fmt}'")
-                    return parsed
-                except ValueError:
-                    continue
-            
-            # If all standard formats fail, try ISO format
-            parsed = datetime.fromisoformat(timestamp_str)
-            logger.debug(f"Parsed timestamp '{timestamp_str}' using ISO format")
-            return parsed
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse timestamp '{timestamp_str}': {str(e)}")
-            print(f"Failed to parse timestamp: {timestamp_str}, error: {e}")
-            return None
-
-    def _format_date_for_api(self, dt: datetime) -> str:
-        """
-        Format datetime to YYYYMMDDTHHMM format required by Alpha Vantage API.
-        
-        Args:
-            dt: datetime object to format
-        
-        Returns:
-            Formatted string: YYYYMMDDTHHMM (e.g., "20240115T1430")
-        """
-        return dt.strftime("%Y%m%dT%H%M")
-
-    def start_consuming(self):
-        """
-        Start consuming timestamps from Kafka in a background thread.
-        
-        This method initializes a Kafka consumer and starts a daemon thread
-        that continuously updates the date range based on received timestamps.
-        """
-        self.running = True
-        kafka_broker = os.getenv("KAFKA_BROKER")
-        if not kafka_broker:
-            logger.error("KAFKA_BROKER environment variable not set")
-            raise ValueError("KAFKA_BROKER environment variable is required")
-        
-        logger.info(f"Initializing Kafka consumer for topic '{TIMESTAMP_TOPIC}' (broker: {kafka_broker})")
-        self.consumer = KafkaConsumer(
-            TIMESTAMP_TOPIC,
-            bootstrap_servers=kafka_broker,
-            auto_offset_reset="latest",  # Start from latest messages (don't replay old timestamps)
-            enable_auto_commit=True,
-            group_id="news-timestamp-consumer",
-            value_deserializer=lambda m: m.decode('utf-8')  # Decode bytes to string
-        )
-
-        thread = Thread(target=self._consume_loop, daemon=True)
-        thread.start()
-        logger.info("Started timestamp consumer thread (daemon)")
-        print("Started timestamp consumer thread")
-
-
-    def _consume_loop(self):
-        """
-        Continuously consume timestamps and update date range.
-        
-        This method runs in a background thread and polls Kafka for new timestamps.
-        When a timestamp is received, it updates the date range to a 10-day window
-        ending at the received timestamp.
-        """
-        logger.info("Timestamp consumer loop started")
-        while self.running:
-            try:
-                # Poll for messages with 1 second timeout
-                messages = self.consumer.poll(timeout_ms=1000)
-                
-                for topic_partition, records in messages.items():
-                    for record in records:
-                        timestamp_str = record.value
-                        logger.debug(f"Received timestamp: {timestamp_str}")
-                        dt = self._parse_timestamp(timestamp_str)
-
-                        if dt:
-                            with self.lock:
-                                # Format dates for Alpha Vantage API (YYYYMMDDTHHMM)
-                                # Use 10-day lookback window for news queries
-                                self.current_end_date = self._format_date_for_api(dt)
-                                start_dt = dt - timedelta(days=10)
-                                self.current_start_date = self._format_date_for_api(start_dt)
-                                logger.info(
-                                    f"Updated date range: {self.current_start_date} to {self.current_end_date} "
-                                    f"(10-day window)"
-                                )
-            except Exception as e:
-                logger.error(f"Error in timestamp consumer: {str(e)}", exc_info=True)
-                print(f"Error in timestamp consumer: {e}")
-                time.sleep(1)  # Wait before retrying
-
-    def get_date_range(self):
-        """
-        Get current start and end dates in a thread-safe manner.
-        
-        Returns:
-            Tuple of (start_date, end_date) strings in YYYYMMDDTHHMM format,
-            or (None, None) if no dates have been set yet.
-        """
-        with self.lock:
-            return self.current_start_date, self.current_end_date
-
-    def stop(self):
-        """
-        Stop the timestamp consumer gracefully.
-        
-        Sets running flag to False and closes Kafka consumer connection.
-        """
-        logger.info("Stopping timestamp consumer")
-        self.running = False
-        if self.consumer:
-            self.consumer.close()
-            logger.info("Timestamp consumer closed")
+# Removed TimestampManager as we now query ClickHouse directly
 
 
 class ClickHouseNewsWriter:
@@ -252,47 +97,85 @@ class ClickHouseNewsWriter:
     """
     
     def __init__(self):
-        """Initialize ClickHouse writer and test connection."""
+        """Initialize ClickHouse writer and test connection with retry logic."""
         self.url = os.getenv("CLICKHOUSE_URL")
         if not self.url:
             logger.error("CLICKHOUSE_URL environment variable not set")
             raise ValueError("CLICKHOUSE_URL environment variable is required")
         
-        # Test connection to ClickHouse
+        # Test connection to ClickHouse with retry logic
+        max_retries = 10
+        retry_delay = 3  # seconds
+        
         logger.info(f"Testing ClickHouse connection: {self.url}")
-        try:
-            response = requests.get(self.url, params={"query": "SELECT 1"}, timeout=5)
-            if response.status_code == 200:
-                logger.info("ClickHouse HTTP connection established successfully")
-                print("ClickHouse HTTP connection established successfully")
-            else:
-                logger.warning(f"ClickHouse connection returned status {response.status_code}")
-                print(f"ClickHouse connection warning: {response.status_code}")
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(self.url, params={"query": "SELECT 1"}, timeout=5)
+                if response.status_code == 200:
+                    logger.info("ClickHouse HTTP connection established successfully")
+                    print("ClickHouse HTTP connection established successfully")
+                    return
+                else:
+                    logger.warning(f"ClickHouse connection returned status {response.status_code}")
+                    print(f"ClickHouse connection warning: {response.status_code}")
 
+            except Exception as e:
+                logger.warning(f"ClickHouse connection attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                print(f"ClickHouse connection attempt {attempt + 1}/{max_retries} failed, retrying in {retry_delay}s...")
+                
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to connect to ClickHouse after {max_retries} attempts: {str(e)}", exc_info=True)
+                    print(f"ERROR: Failed to connect to ClickHouse after {max_retries} attempts")
+                    raise
+
+    def get_latest_timestamp(self):
+        """Query ClickHouse for the latest timestamp in the final_table."""
+        try:
+            query = "SELECT MAX(timestamp) FROM market_data.final_table"
+            response = requests.get(
+                self.url,
+                params={"query": query},
+                timeout=5
+            )
+            if response.status_code == 200:
+                ts_str = response.text.strip()
+                if ts_str and ts_str != "1970-01-01 00:00:00":
+                    # Remove surrounding quotes if present
+                    ts_str = ts_str.strip("'\"")
+                    # Parse assuming format "YYYY-MM-DD HH:MM:SS"
+                    try:
+                        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        end_date = dt.strftime("%Y%m%dT%H%M")
+                        start_date = (dt - timedelta(days=10)).strftime("%Y%m%dT%H%M")
+                        return start_date, end_date
+                    except ValueError:
+                        logger.warning(f"Failed to parse timestamp from ClickHouse: {ts_str}")
+            return None, None
         except Exception as e:
-            logger.error(f"ClickHouse connection error: {str(e)}", exc_info=True)
-            print(f"ClickHouse connection error: {e}")
-            raise
+            logger.error(f"Failed to get latest timestamp from ClickHouse: {e}")
+            return None, None
 
 
     def insert(self, ticker: str, news_data: dict, cycle: int):
+        """Legacy single-insert method (kept for backward compatibility)."""
+        self.bulk_insert({ticker: news_data}, cycle)
+
+    def bulk_insert(self, all_ticker_news: dict, cycle: int):
         """
-        Insert aggregated news data for a single ticker using HTTP interface.
+        Insert all aggregated news data using a single HTTP bulk request.
         
         Args:
-            ticker: Stock ticker symbol (e.g., 'AAPL')
-            news_data: Dictionary containing aggregated news data:
-                - titles: List of news headlines
-                - timestamps: List of publication timestamps
-                - sentiment_scores: List of sentiment scores
-                - relevance_scores: List of relevance scores
-                - weighted_avg_sentiment: Weighted average sentiment score
-                - news_url: URL to news article
+            all_ticker_news: Dictionary mapping tickers to their news data
             cycle: Processing cycle number for tracking
         """
-        try:
-            # Create JSON row in JSONEachRow format (ClickHouse requirement)
-            json_row = json.dumps({
+        if not all_ticker_news:
+            return
+            
+        json_rows = []
+        for ticker, news_data in all_ticker_news.items():
+            json_rows.append(json.dumps({
                 "symbol": ticker,
                 "news_titles": news_data["titles"],
                 "news_timestamps": news_data["timestamps"],
@@ -301,41 +184,30 @@ class ClickHouseNewsWriter:
                 "weighted_avg_sentiment": news_data["weighted_avg_sentiment"],
                 "news_url": news_data["news_url"],
                 "cycle": cycle
-            })
-
-            # Insert using ClickHouse HTTP interface with JSONEachRow format
+            }))
+            
+        # Join rows with newlines for JSONEachRow format
+        bulk_data = "\n".join(json_rows)
+        
+        try:
             query = "INSERT INTO market_data.sentiment_stream FORMAT JSONEachRow"
             response = requests.post(
                 self.url,
                 params={"query": query},
-                data=json_row,
+                data=bulk_data,
                 headers={"Content-Type": "application/x-ndjson"},
-                timeout=10
+                timeout=30  # Increased timeout for bulk insert
             )
 
             if response.status_code == 200:
-                headline_count = len(news_data['titles'])
-                logger.info(
-                    f"Inserted aggregated data for {ticker} → ClickHouse "
-                    f"({headline_count} headlines, cycle {cycle})"
-                )
-                print(f"✓ Inserted aggregated data for {ticker} → ClickHouse ({headline_count} headlines)")
-
+                logger.info(f"Bulk inserted {len(all_ticker_news)} tickers → ClickHouse (cycle {cycle})")
+                print(f"✓ Bulk inserted {len(all_ticker_news)} tickers → ClickHouse")
             else:
-                logger.error(
-                    f"HTTP insert failed for {ticker}: Status {response.status_code}, "
-                    f"Response: {response.text[:200]}"
-                )
-                print(f"✗ HTTP insert failed for {ticker}: Status {response.status_code}, Response: {response.text}")
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"ClickHouse insert request failed for {ticker}: {str(e)}", exc_info=True)
-            print(f"✗ ClickHouse insert failed for {ticker}: {e}")
+                logger.error(f"Bulk HTTP insert failed: Status {response.status_code}, Response: {response.text[:200]}")
+                print(f"✗ Bulk HTTP insert failed: Status {response.status_code}")
         except Exception as e:
-            logger.error(f"ClickHouse insert failed for {ticker}: {str(e)}", exc_info=True)
-            print(f"✗ ClickHouse insert failed for {ticker}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"ClickHouse bulk insert failed: {str(e)}", exc_info=True)
+            print(f"✗ ClickHouse bulk insert failed: {e}")
 
 
 class NewsIngestionService:
@@ -352,22 +224,9 @@ class NewsIngestionService:
     """
     
     def __init__(self):
-        """Initialize news ingestion service with Kafka producer and dependencies."""
-        kafka_broker = os.getenv("KAFKA_BROKER")
-        if not kafka_broker:
-            logger.error("KAFKA_BROKER environment variable not set")
-            raise ValueError("KAFKA_BROKER environment variable is required")
-        
-        logger.info(f"Initializing Kafka producer (broker: {kafka_broker})")
-        self.producer = KafkaProducer(
-            bootstrap_servers=kafka_broker,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            retries=3,  # Retry failed sends up to 3 times
-            linger_ms=100  # Wait 100ms to batch messages
-        )
+        """Initialize news ingestion service with dependencies."""
         self.hash_set = set()  # Track processed news items to avoid duplicates
         self.ch = ClickHouseNewsWriter()
-        self.timestamp_manager = TimestampManager()
         logger.info("NewsIngestionService initialized")
 
     def _hash(self, title: str, url: str) -> str:
@@ -388,71 +247,86 @@ class NewsIngestionService:
         logger.info(f"Fetching news for topic '{topic}' (from {start_date} to {end_date})")
         print(f"Fetching → {topic} (from {start_date} to {end_date})")
 
-        params = {
-            "function": "NEWS_SENTIMENT",
-            "topics": topic,
-            "limit": 200,  # Maximum articles per request
-            "time_from": start_date,
-            "time_to": end_date,
-            "apikey": ALPHA_API_KEY
-        }
-        
-        try:
-            r = requests.get(BASE_URL, params=params, timeout=30)
-            if r.status_code != 200:
-                logger.warning(f"API returned status {r.status_code}: {r.text[:200]}")
-                print(f"HTTP {r.status_code}: {r.text[:200]}")
-                return []
-            
-            data = r.json()
-            logger.debug(f"API Response keys: {list(data.keys())}")
-
-            # Handle API rate limiting
-            if "Note" in data:
-                logger.warning(f"Rate limit message: {data['Note']}")
-                logger.info("Rate limit detected → sleeping 65 seconds")
-                print(f"Rate limit message: {data['Note']}")
-                print("Rate limit → sleep 65s")
-                time.sleep(65)
-                return []
-
-            if "Information" in data:
-                logger.warning(f"API Information: {data['Information']}")
-                logger.info("API issue detected → sleeping 65 seconds")
-                print(f"API Information: {data['Information']}")
-                print("Rate limit or API issue → sleep 65s")
-                time.sleep(65)
-                return []
-
-            if "Error Message" in data:
-                logger.error(f"API Error: {data['Error Message']}")
-                print(f"API Error: {data['Error Message']}")
-                return []
-
-            feed = data.get("feed", [])
-            if not feed:
-                logger.warning("No feed data in API response")
-                logger.debug(f"Full response: {json.dumps(data, indent=2)[:500]}")
-                print("Warning: No feed data in response")
-                print(f"Full response: {json.dumps(data, indent=2)[:500]}")
-
-            logger.info(f"Fetched {len(feed)} news items for topic '{topic}'")
+        # Use dummy API if configured
+        if USE_DUMMY_API:
+            logger.info("[DUMMY MODE] Using synthetic news data instead of real API")
+            import dummy_api
+            data = dummy_api.get_news(
+                topics=[topic],
+                time_from=start_date,
+                time_to=end_date,
+                limit=200
+            )
+            feed = data.get("results", [])
+            logger.info(f"[DUMMY MODE] Generated {len(feed)} synthetic news items for topic '{topic}'")
             return feed
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"Request timeout while fetching topic '{topic}'")
-            print(f"Request timeout for {topic}")
-            return []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error for topic '{topic}': {str(e)}", exc_info=True)
-            print(f"Request error: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error fetching topic '{topic}': {str(e)}", exc_info=True)
-            print(f"Request error: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+
+        # ========== ORIGINAL CODE (commented out) ==========
+        # params = {
+        #     "function": "NEWS_SENTIMENT",
+        #     "topics": topic,
+        #     "limit": 200,  # Maximum articles per request
+        #     "time_from": start_date,
+        #     "time_to": end_date,
+        #     "apikey": ALPHA_API_KEY
+        # }
+        # 
+        # try:
+        #     r = requests.get(BASE_URL, params=params, timeout=30)
+        #     if r.status_code != 200:
+        #         logger.warning(f"API returned status {r.status_code}: {r.text[:200]}")
+        #         print(f"HTTP {r.status_code}: {r.text[:200]}")
+        #         return []
+        #     
+        #     data = r.json()
+        #     logger.debug(f"API Response keys: {list(data.keys())}")
+        # 
+        #     # Handle API rate limiting
+        #     if "Note" in data:
+        #         logger.warning(f"Rate limit message: {data['Note']}")
+        #         logger.info("Rate limit detected → sleeping 65 seconds")
+        #         print(f"Rate limit message: {data['Note']}")
+        #         print("Rate limit → sleep 65s")
+        #         time.sleep(65)
+        #         return []
+        # 
+        #     if "Information" in data:
+        #         logger.warning(f"API Information: {data['Information']}")
+        #         logger.info("API issue detected → sleeping 65 seconds")
+        #         print(f"API Information: {data['Information']}")
+        #         print("Rate limit or API issue → sleep 65s")
+        #         time.sleep(65)
+        #         return []
+        # 
+        #     if "Error Message" in data:
+        #         logger.error(f"API Error: {data['Error Message']}")
+        #         print(f"API Error: {data['Error Message']}")
+        #         return []
+        # 
+        #     feed = data.get("feed", [])
+        #     if not feed:
+        #         logger.warning("No feed data in API response")
+        #         logger.debug(f"Full response: {json.dumps(data, indent=2)[:500]}")
+        #         print("Warning: No feed data in response")
+        #         print(f"Full response: {json.dumps(data, indent=2)[:500]}")
+        # 
+        #     logger.info(f"Fetched {len(feed)} news items for topic '{topic}'")
+        #     return feed
+        #     
+        # except requests.exceptions.Timeout:
+        #     logger.error(f"Request timeout while fetching topic '{topic}'")
+        #     print(f"Request timeout for {topic}")
+        #     return []
+        # except requests.exceptions.RequestException as e:
+        #     logger.error(f"Request error for topic '{topic}': {str(e)}", exc_info=True)
+        #     print(f"Request error: {e}")
+        #     return []
+        # except Exception as e:
+        #     logger.error(f"Unexpected error fetching topic '{topic}': {str(e)}", exc_info=True)
+        #     print(f"Request error: {e}")
+        #     import traceback
+        #     traceback.print_exc()
+        #     return []
 
     def process_batch(self, feed: list):
         """
@@ -545,8 +419,8 @@ class NewsIngestionService:
         Main execution loop for news ingestion service.
         
         This method:
-        1. Starts timestamp consumer for dynamic date ranges
-        2. Waits for initial timestamp (with timeout)
+        1. Queries ClickHouse for the latest timestamp to set date ranges
+        2. Waits for initial data (with timeout)
         3. Runs continuous ingestion cycles (every 2 hours)
         4. Fetches news for all topics
         5. Aggregates and publishes results
@@ -554,24 +428,16 @@ class NewsIngestionService:
         logger.info("Starting News Ingestion Service with Dynamic Date Range")
         print("Starting Ultra-Efficient News Ingestion with Dynamic Date Range")
 
-        # Start timestamp consumer in background thread
-        logger.info("Starting timestamp consumer")
-        self.timestamp_manager.start_consuming()
-
-        # Wait for first timestamp to arrive (with timeout)
-        # This ensures we have a valid date range before starting ingestion
-        logger.info("Waiting for timestamp data from Kafka...")
-        print("Waiting for timestamp data from Kafka...")
-
+        logger.info("Waiting for timestamp data from ClickHouse...")
+        print("Waiting for timestamp data from ClickHouse...")
 
         while True:
-            start_date, end_date = self.timestamp_manager.get_date_range()
+            start_date, end_date = self.ch.get_latest_timestamp()
             if start_date and end_date:
                 logger.info(f"Initial date range set: {start_date} to {end_date}")
                 print(f"Initial date range set: {start_date} to {end_date}")
                 break
             time.sleep(2)
-
 
         cycle = 0
         try:
@@ -579,13 +445,12 @@ class NewsIngestionService:
             while True:
                 cycle += 1
 
-                # Get current date range (may have been updated by timestamp consumer)
-                start_date, end_date = self.timestamp_manager.get_date_range()
+                # Get current date range
+                start_date, end_date = self.ch.get_latest_timestamp()
                 if not start_date or not end_date:
-                    # Fallback to default if timestamp manager hasn't received data
-                    logger.warning("No date range available, waiting for timestamp")
+                    logger.warning("No date range available, waiting for data in ClickHouse")
                     while True:
-                        start_date, end_date = self.timestamp_manager.get_date_range()
+                        start_date, end_date = self.ch.get_latest_timestamp()
                         if start_date and end_date:
                             break
                         time.sleep(2)
@@ -640,28 +505,10 @@ class NewsIngestionService:
                 logging.info(f"\n--- Publishing Results ---")
                 logging.info(f"Total unique tickers to publish: {len(all_ticker_news)}")
 
-                # Send aggregated data to Kafka and ClickHouse
-                published_count = 0
-                for ticker, news_data in all_ticker_news.items():
-                    message = {
-                        "ticker": ticker,
-                        "news_titles": news_data["titles"],
-                        "news_timestamps": news_data["timestamps"],
-                        "sentiment_scores": news_data["sentiment_scores"],
-                        "relevance_scores": news_data["relevance_scores"],
-                        "weighted_avg_sentiment": news_data["weighted_avg_sentiment"],
-                        "news_url": news_data["news_url"],
-                        "cycle": cycle
-                    }
-
-                    self.producer.send(KAFKA_TOPIC, value=message)
-                    self.ch.insert(ticker, news_data, cycle)
-                    published_count += 1
-
-                    if published_count % 10 == 0:
-                        print(f"Published {published_count}/{len(all_ticker_news)} tickers...")
-                        logging.info(f"Published {published_count}/{len(all_ticker_news)} tickers...")
-                        
+                # Send aggregated data to ClickHouse via Bulk Insert
+                published_count = len(all_ticker_news)
+                if published_count > 0:
+                    self.ch.bulk_insert(all_ticker_news, cycle)
 
                 print(f"\n{'=' * 60}")
                 print(f"Cycle {cycle} complete - Published {published_count} tickers")
@@ -681,13 +528,8 @@ class NewsIngestionService:
             logger.error(f"Fatal error in main loop: {str(e)}", exc_info=True)
             raise
         finally:
-            # Cleanup resources
-            logger.info("Cleaning up resources...")
-            self.timestamp_manager.stop()
-            self.producer.flush()
-            self.producer.close()
-            logger.info("Producer closed. Service shutdown complete.")
-            print("Producer closed. Bye!")
+            logger.info("Service shutdown complete.")
+            print("Bye!")
 
 if __name__ == "__main__":
     service = NewsIngestionService()
